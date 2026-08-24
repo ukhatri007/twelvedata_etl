@@ -1,0 +1,20 @@
+[project]
+name = "twelvedata-etl"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "pandas==2.2.3",
+    "requests==2.32.5",
+    "snowflake-connector-python[pandas]==4.6.0",
+    "dotenv==0.9.9",
+    "pip",
+    "black",
+]
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = [ "utilities"]
