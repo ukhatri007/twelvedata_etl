@@ -88,3 +88,26 @@ class SnowflakeOperation:
         cursor = self.conn.cursor()
         cursor.execute(query_string)
         return cursor.fetch_pandas_all()
+
+
+@dataclass
+class SchemaDriftHandler:
+        database: str
+        schema: str
+        table_name: str
+        user: str = os.getenv("SNOWFLAKE_USER")
+        password: str = os.getenv("SNOWFLAKE_PASSWORD")
+        account: str = os.getenv("SNOWFLAKE_ACCOUNT")
+        warehouse: str = os.getenv("SNOWFLAKE_WAREHOUSE")
+    
+        def __post_init__(self):
+            snowflake_conn = SnowflakeConnection(
+                database=self.database,
+                schema=self.schema,
+                user=self.user,
+                password=self.password,
+                account=self.account,
+                warehouse=self.warehouse,
+            )
+            self.conn = snowflake_conn.create_conn()
+    

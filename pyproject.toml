@@ -8,9 +8,10 @@ dependencies = [
     "pandas==2.2.3",
     "requests==2.32.5",
     "snowflake-connector-python[pandas]==4.6.0",
-    "dotenv==0.9.9",
     "pip",
     "black",
+    "apache-airflow-providers-snowflake>=6.11.0",
+    "python-dotenv>=1.2.3",
 ]
 [build-system]
 requires = ["hatchling"]
