@@ -154,7 +154,6 @@ class SchemaDriftHandler:
         df = cursor.fetch_pandas_all()
         df.columns = ['column_name', 'data_type']
         columns_list = df.to_dict(orient='records')
-        logging.info(columns_list)
         return columns_list
 
     def check_schema_drift(self, details: dict) -> list:
@@ -171,7 +170,9 @@ class SchemaDriftHandler:
         }
         
         dest_column = self.column_name_data_type(details=dest_details)
+        logging.info(f"destination column names: {dest_column}")
         source_column = self.column_name_data_type(details= source_details)
+        logging.info(f"source column names: {source_column}")
 
         dest_columns = [column['column_name'] for column in dest_column]
 
