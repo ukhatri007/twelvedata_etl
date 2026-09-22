@@ -9,10 +9,9 @@ from concurrent.futures import ThreadPoolExecutor
 from dotenv import load_dotenv
 
 from airflow.sdk import DAG
-from airflow.providers.snowflake.hooks.snowflake import SnowflakeHook
 from airflow.providers.standard.operators.python import PythonOperator
 
-from snowflake.connector.pandas_tools import write_pandas
+from include.utilities.utils_snowflake import SnowflakeDestination
 
 load_dotenv()
 
@@ -25,7 +24,7 @@ WINDOW_SECONDS = 60      # cooldown between batches
 REQUEST_TIMEOUT = 30     # seconds, per HTTP request
 
 SYMBOLS = ["AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "META", "TSLA", "JPM", "V", "JNJ"]
-STAGING_PATH = "/tmp/twelvedata_staging.parquet"
+
 
 
 def extract(**kwargs):
@@ -34,7 +33,7 @@ def extract(**kwargs):
     API rate limit by batching requests, and stage the combined result to
     parquet. Pushes the staging file path (kept small for XCom) via ti.xcom_push.
     """
-    ti = kwargs["ti"]
+    ti = kwargs.get("ti")  # None when run outside Airflow
 
     def fetch_time_series(symbol: str):
         params = {
@@ -111,43 +110,34 @@ def extract(**kwargs):
     final_df = pd.concat(final_data, ignore_index=True)
     logging.info(f"Extracted {len(final_df)} rows across {final_df['symbol'].nunique()} symbols")
 
-    final_df.to_parquet(STAGING_PATH, index=False)
-    ti.xcom_push(key="staging_path", value=STAGING_PATH)
+
+    if ti is not None:
+        ti.xcom_push(key="data", value=final_df)
+
+    return final_df
 
 
-# def handle_schema(**kwargs):
-#     ti = kwargs["ti"]
-#     staging_path = ti.xcom_pull(task_ids="extract", key="staging_path")
-#     df= pd.read_parquet(staging_path)
 
 def load(**kwargs):
-    ti = kwargs["ti"]
-    staging_path = ti.xcom_pull(task_ids="extract", key="staging_path")
- 
-    df = pd.read_parquet(staging_path)
-    logging.info(f"Loading {len(df)} rows into Snowflake from {staging_path}")
- 
-    hook = SnowflakeHook(snowflake_conn_id='destination_conn')
-    logging.info("Creating a connection using Hook")
-    conn = hook.get_conn()
-    logging.info("Connection successful")
- 
-    success, num_chunks, num_rows, _ = write_pandas(
-        conn=conn,
-        df=df,
-        table_name="TWELVE_DATA",  
-        auto_create_table=True,
-        overwrite=False,          
-    )
- 
-    logging.info(f"Loaded {num_rows} rows into TWELVE_DATA. Success: {success}")
-    conn.close()
- 
-    # Clean up the staging file now that it's loaded
-    if os.path.exists(staging_path):
-        os.remove(staging_path)
+    ti = kwargs.get("ti")  # None when run outside Airflow
+    df = ti.xcom_pull(task_ids="extract", key="data")
+    df["new_col"] = 0
+    df["new_col"] = df["new_col"].astype("int64")
+    df = df.copy()
+
+   
+    details = {
+        "table_name": "twelve_data",
+        "database": "TWELVEDATA_DB",
+        "schema": "TWELVEDATA"
+    }
+
+    sf_dest = SnowflakeDestination()
+    sf_dest.load_into_snowflake(df=df, details=details)
 
 
+
+    
 with DAG(
     dag_id="twelvedata_extract_load",
     description="Extract daily stock time series from TwelveData and load into Snowflake",
@@ -156,7 +146,7 @@ with DAG(
     catchup=False,
     max_active_runs=1,
     default_args={
-        "retries": 2,
+        "retries": 0,
         "retry_delay": timedelta(minutes=5),
         "retry_exponential_backoff": True,
         "owner": "Ujjwol kc",
