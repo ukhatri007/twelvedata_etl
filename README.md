@@ -30,6 +30,15 @@ Apache Airflow is used to orchestrate the extraction and loading process.
 <img src="image/twelve_data.png" alt="Twelve Data ETL pipeline" width="500">
 
 ---
+## Why This Architecture?
+
+* **Airflow** - Orchestrates `extract` and `load` as separate tasks, so a failed Snowflake load is re-run alone without spending extra API credits.
+* **Python + Pandas** - The API's JSON converts straight into a DataFrame, and `ThreadPoolExecutor` speeds up the network-bound API calls.
+* **Rate-limit aware** - Symbols are fetched in batches of 7 with a 60-second window to stay within the Twelve Data free tier.
+* **Fault tolerant** - Every response is validated, and one bad symbol is skipped instead of failing the whole run.
+* **Snowflake** - `write_pandas` bulk loads with `COPY INTO`, and its quick `ALTER TABLE` made automatic schema drift handling easy.
+* **Modular code** - Snowflake logic lives in reusable utilities under `include/`, and credentials stay in `.env` and an Airflow connection.
+---
 
 ## Technology Stack
 
@@ -49,6 +58,7 @@ Apache Airflow is used to orchestrate the extraction and loading process.
 | **Testing**               | Pytest                                                       |
 
 ---
+
 
 ## Source Data
 
@@ -103,19 +113,6 @@ If all requests fail, the pipeline raises an error indicating that no data was s
 
 ---
 
-## Prerequisites
-**Required Software:**
-
-* Python
-* UV
-* Docker
-* Apache Airflow
-* Snowflake account
-
-**Required External Access:**
-
-* Twelve Data API key
-* Snowflake account with network access
 
 ### Environment Variables
 
@@ -190,7 +187,7 @@ Trigger the `twelvedata_extract_load` DAG from the Airflow interface.
 
 ---
 
-## Future plan that I will work on
+## Future improvements
 
 * **Incremental Loading** - Load only new or changed market data instead of repeatedly processing the same data.
 * **Data Quality** - Add stronger validation and automated data-quality checks.
