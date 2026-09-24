@@ -11,7 +11,7 @@ from dotenv import load_dotenv
 from airflow.sdk import DAG
 from airflow.providers.standard.operators.python import PythonOperator
 
-from include.utilities.utils_snowflake import SnowflakeDestination
+from include.utilities.utils_snowflake import SnowflakeDestination, SnowflakeConnection
 
 load_dotenv()
 
@@ -132,8 +132,9 @@ def load(**kwargs):
         "schema": "TWELVEDATA"
     }
 
-    sf_dest = SnowflakeDestination()
-    sf_dest.load_into_snowflake(df=df, details=details)
+    with SnowflakeConnection("destination_conn") as conn:
+        sf_dest = SnowflakeDestination(conn)
+        sf_dest.load_into_snowflake(df=df,details=details)
 
 
 

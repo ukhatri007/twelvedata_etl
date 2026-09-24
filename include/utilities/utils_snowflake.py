@@ -1,201 +1,251 @@
-import os
-import snowflake.connector.pandas_tools
-from datetime import datetime, timezone
-from airflow.providers.snowflake.hooks.snowflake import SnowflakeHook
+import pandas as pd
 import logging
+from  snowflake.connector.pandas_tools  import write_pandas
+import re
 
+from contextlib import closing
+from datetime import datetime, timezone
+from typing import Any, Iterable
+from airflow.providers.snowflake.hooks.snowflake import SnowflakeHook
 
-from dataclasses import dataclass
-# from dotenv import load_dotenv
+logger = logging.getLogger(__name__)
 
-# load_dotenv()
+_IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_$]*$")
 
+_DTYPE_TO_SNOWFLAKE = {
+    "int64": "NUMBER(38,0)",
+    "int32": "NUMBER(38,0)",
+    "float64": "FLOAT",
+    "float32": "FLOAT",
+    "bool": "BOOLEAN",
+    "datetime64[ns]": "TIMESTAMP_NTZ",
+    "datetime64[ns, UTC]": "TIMESTAMP_TZ",
+    "object": "VARCHAR",
+    "string": "VARCHAR",
+}
 
-@dataclass
+def safe_identifier(name: str) -> str:
+    """Validate and normalize a SQL identifier (db/schema/table/column name).
+ 
+    Snowflake identifiers can't be bound as query parameters, so unlike
+    literal values they must be whitelisted before interpolation.
+    """
+    candidate = str(name).strip().upper()
+    if not _IDENTIFIER_RE.match(candidate):
+        raise ValueError(f"Unsafe or invalid SQL identifier: {name!r}")
+    return candidate
+
+def snowflake_type_for(dtype: Any) -> str:
+    return _DTYPE_TO_SNOWFLAKE.get(str(dtype), "VARCHAR")
+
+ 
 class SnowflakeConnection:
-   
-    def snowflake_conn(self):
-        hook = SnowflakeHook(snowflake_conn_id="destination_conn")
+    """Context manager that owns exactly one underlying connection."""
+ 
+    def __init__(self, conn_id: str = "destination_conn"):
+        self.conn_id = conn_id
+        self.conn = None
+ 
+    def __enter__(self):
+        hook = SnowflakeHook(snowflake_conn_id=self.conn_id)
         self.conn = hook.get_conn()
         return self.conn
+ 
+    def __exit__(self, exc_type, exc, tb):
+        if self.conn is not None:
+            try:
+                self.conn.close()
+            except Exception:
+                logger.warning("Failed to cleanly close Snowflake connection", exc_info=True)
+        return False  # never suppress exceptions
+ 
 
-
-@dataclass
-class SnowflakeDestination:
-
-    def __post_init__(self):
-       self.conn = SnowflakeConnection().snowflake_conn()
-
-    def wrirte_dataframe(self ,df, details:dict):
-        df.columns = df.columns.str.upper()  
-
-        try:
-            success, nchunks, nrows, _ = snowflake.connector.pandas_tools.write_pandas(
-                self.conn,
-                df,
-                table_name=details["table_name"],
-                database=details["database"],
-                schema=details["schema"],
-                auto_create_table=True,
-                overwrite=False,
-                quote_identifiers=False
-            )
-            logging.info(
-                f"Data loaded into Snowflake table: {details["table_name"]}\n"
-                f"Success: {success}\nNumber of rows: {nrows}\nNumber of chunks: {nchunks}"
-            )
-
-        except Exception as e:
-            logging.info(f"Failed to load data into {details['table_name']}: {e}")
-            raise
-
-
-    def load_into_snowflake(self, df, details):
-        table_exists_response = SnowflakeOperation().check_if_table_exists(details=details)
-        
-        if not table_exists_response:
-            load = self.wrirte_dataframe(df, details=details)
-            return load
-        
-        timestamp = int(datetime.now(timezone.utc).timestamp())
-        timestamp_suffix = str(timestamp)
-        temp_table = f"{details['table_name']}_{timestamp_suffix}".upper()
-        temp_details = {
-            "table_name": temp_table,
-            "database": details["database"].upper(),
-            "schema": details["schema"].upper()
-        }
-       
-        load = self.wrirte_dataframe(df, details=temp_details)
-        schema_details = {
-            "dest_table": details["table_name"].upper(),
-            "database": details["database"].upper(),
-            "schema": details["schema"].upper(),
-            "source_table": temp_table
-        }
-
-        handle_scheam = SchemaDriftHandler()
-        handle_scheam.handle_schema_drift(details=schema_details)
-        load = self.wrirte_dataframe(df, details=details)
-        SnowflakeOperation().delete_table(details=schema_details)
-    
-
-@dataclass
 class SnowflakeOperation:
-    def __post_init__(self):
-      self.conn = SnowflakeConnection().snowflake_conn()
-        
 
-    def query_df(self, query_string: str):
-        cursor = self.conn.cursor()
-        cursor.execute(query_string)
-        return cursor.fetch_pandas_all()
-
-    def delete_table(self, details):
-        database = details["database"]
-        schema = details["schema"]
-        table_name = details["source_table"]
-
-        cursor = self.conn.cursor()
-        cursor.execute(f"DROP TABLE IF EXISTS {database}.{schema}.{table_name}")
-        logging.info(f"Table {database}.{schema}.{table_name} deleted successfully.")
-
-    def check_if_table_exists(self, details) -> bool:
+    """Low-level DDL/introspection helpers. Takes a connection; opens none of its own."""
+ 
+    def __init__(self, conn):
+        self.conn = conn
+ 
+    def query_df(self, query_string: str) -> pd.DataFrame:
+        with closing(self.conn.cursor()) as cursor:
+            cursor.execute(query_string)
+            return cursor.fetch_pandas_all()
+ 
+    def delete_table(self, details: dict) -> None:
+        database = safe_identifier(details["database"])
+        schema = safe_identifier(details["schema"])
+        table_name = safe_identifier(details["source_table"])
+ 
+        with closing(self.conn.cursor()) as cursor:
+            cursor.execute(f"DROP TABLE IF EXISTS {database}.{schema}.{table_name}")
+        logger.info("Table %s.%s.%s dropped.", database, schema, table_name)
+ 
+    def check_if_table_exists(self, details: dict) -> bool:
+        database = safe_identifier(details["database"])
         table_name = details["table_name"].upper()
-        database = details["database"].upper()
         schema = details["schema"].upper()
-
-        cursor = self.conn.cursor()
+ 
         query = f"""
             SELECT 1
             FROM {database}.INFORMATION_SCHEMA.TABLES
-            WHERE table_name = '{table_name}'
-            AND table_schema = '{schema}'
+            WHERE table_name = %s AND table_schema = %s
         """
-        cursor.execute(query)
-        result = cursor.fetchone()
-        return result is not None
-        
+        with closing(self.conn.cursor()) as cursor:
+            cursor.execute(query, (table_name, schema))
+            return cursor.fetchone() is not None
+ 
+    def get_table_columns(self, database: str, schema: str, table_name: str) -> set[str]:
+        database = safe_identifier(database)
+        query = f"""
+            SELECT column_name
+            FROM {database}.INFORMATION_SCHEMA.COLUMNS
+            WHERE table_name = %s AND table_schema = %s
+        """
+        with closing(self.conn.cursor()) as cursor:
+            cursor.execute(query, (table_name.upper(), schema.upper()))
+            return {row[0] for row in cursor.fetchall()}
+ 
+    def add_column(self, details: dict) -> None:
+        database = safe_identifier(details["database"])
+        schema = safe_identifier(details["schema"])
+        table_name = safe_identifier(details["table_name"])
+        column_name = safe_identifier(details["column_name"])
+        data_type = details["data_type"]  # not a free-form identifier; comes from our own type map
+ 
+        with closing(self.conn.cursor()) as cursor:
+            cursor.execute(
+                f"ALTER TABLE {database}.{schema}.{table_name} ADD COLUMN {column_name} {data_type}"
+            )
+        logger.info("Column %s (%s) added to %s.%s.%s", column_name, data_type, database, schema, table_name)
 
-    def add_column(self, details):
-        database = details["database"]
-        schema = details["schema"]
-        table_name = details["table_name"]
-        column_name = details["column_name"]
-        data_type = details["data_type"]
 
-        cursor = self.conn.cursor()
-        cursor.execute(
-            f"ALTER TABLE {database}.{schema}.{table_name} ADD COLUMN {column_name} {data_type}"
-        )
-        logging.info(f"column {column_name} added successfully.")
-        return True
 
-    
-
-@dataclass
 class SchemaDriftHandler:
+    """Detects and reconciles schema drift directly from a DataFrame's dtypes.
+ 
+    Unlike the original approach, this never needs to write the data to a
+    temporary Snowflake table just to introspect its schema.
+    """
+ 
+    def __init__(self, conn):
+        self.conn = conn
+        self.op = SnowflakeOperation(conn)
+ 
+    def missing_columns(self, df: pd.DataFrame, details: dict) -> Iterable[str]:
+        existing = self.op.get_table_columns(details["database"], details["schema"], details["table_name"])
+        return [src_column for src_column in df.columns if src_column.upper() not in existing]
+ 
+    def sync_missing_columns(self, df: pd.DataFrame, details: dict) -> None:
+        database = safe_identifier(details["database"])
+        schema = safe_identifier(details["schema"])
+        table_name = safe_identifier(details["table_name"])
+ 
+        missing = list(self.missing_columns(df, details))
+        if not missing:
+            return
+ 
+        for column in missing:
+            self.op.add_column({
+                "database": database,
+                "schema": schema,
+                "table_name": table_name,
+                "column_name": column,
+                "data_type": snowflake_type_for(df[column].dtype),
+            })
+        logger.info("Synced %d missing column(s) into %s.%s.%s: %s",
+                    len(missing), database, schema, table_name, missing)
+ 
 
-    def __post_init__(self):
-        self.conn = SnowflakeConnection().snowflake_conn()
 
-    def column_name_data_type(self, details) -> list:
-        table_name = details["table_name"]
-        database = details["database"]
-        schema = details["schema"]
-        cursor = self.conn.cursor()
-        cursor.execute(f"""
-            SELECT column_name, data_type
-            FROM {database}.INFORMATION_SCHEMA.COLUMNS 
-            WHERE table_name = '{table_name}'
-              AND table_schema = '{schema}'
-            ORDER BY column_name DESC
-        """)
-        df = cursor.fetch_pandas_all()
-        df.columns = ['column_name', 'data_type']
-        columns_list = df.to_dict(orient='records')
-        return columns_list
-
-    def check_schema_drift(self, details: dict) -> list:
-        source_details={
-            "table_name" : details["source_table"].upper(),
-            "database" : details["database"].upper(),
-            "schema": details["schema"].upper()
-
-        }
-        dest_details={
-            "table_name" : details["dest_table"].upper(),
-            "database" : details["database"].upper(),
-            "schema": details["schema"].upper()
-        }
-        
-        dest_column = self.column_name_data_type(details=dest_details)
-        logging.info(f"destination column names: {dest_column}")
-        source_column = self.column_name_data_type(details= source_details)
-        logging.info(f"source column names: {source_column}")
-
-        dest_columns = [column['column_name'] for column in dest_column]
-
-        missing_column = []
-        for column in source_column:
-            if column['column_name'] not in dest_columns:
-                missing_column.append(column)
-                
-        logging.info(f"missing_column: {missing_column}")
-        return missing_column
-
-    def handle_schema_drift(self, details: dict):
-        dest_name = details["dest_table"]
-        snowflake_op = SnowflakeOperation()
-        missing_columns = self.check_schema_drift(details)
-
-        if missing_columns:
-            for column in missing_columns:
-                add_col_details = {
-                    "database": details["database"],
-                    "schema": details["schema"],
-                    "table_name": dest_name,
-                    "column_name": column["column_name"],
-                    "data_type": column["data_type"],
-                }
-                snowflake_op.add_column(add_col_details)
+class SnowflakeDestination:
+    """High-level load operations. Takes a connection; opens none of its own."""
+ 
+    def __init__(self, conn):
+        self.conn = conn
+        self.op = SnowflakeOperation(conn)
+        self.drift = SchemaDriftHandler(conn)
+ 
+    def write_dataframe(self, df: pd.DataFrame, details: dict) -> None:
+        database = safe_identifier(details["database"])
+        schema = safe_identifier(details["schema"])
+        table_name = safe_identifier(details["table_name"])
+ 
+        df = df.copy()
+        df.columns = df.columns.str.upper()
+ 
+        try:
+            success, nchunks, nrows, _ = write_pandas(
+                self.conn,
+                df,
+                table_name=table_name,
+                database=database,
+                schema=schema,
+                auto_create_table=True,
+                overwrite=False,
+                quote_identifiers=False,
+            )
+            logger.info(
+                "Loaded into %s.%s.%s | success=%s rows=%d chunks=%d",
+                database, schema, table_name, success, nrows, nchunks,
+            )
+        except Exception:
+            logger.error("Failed to load data into %s.%s.%s", database, schema, table_name, exc_info=True)
+            raise
+ 
+    def load_into_snowflake(self, df: pd.DataFrame, details: dict) -> None:
+        """Append `df` to the destination table, evolving its schema first if needed."""
+        if self.op.check_if_table_exists(details):
+            self.drift.sync_missing_columns(df, details)
+        self.write_dataframe(df, details=details)
+ 
+    def merge_into_snowflake(self, df: pd.DataFrame, details: dict) -> None:
+        """Upsert `df` into `details['table_name']`, keyed on `details['merge_keys']`.
+ 
+        Stages `df` in a temporary table (required as the MERGE source),
+        reconciles schema drift, runs the MERGE, then always drops the
+        staging table.
+        """
+        merge_keys = details.get("merge_keys")
+        if not merge_keys:
+            raise ValueError("merge_into_snowflake requires details['merge_keys'] (list of column names)")
+ 
+        database = safe_identifier(details["database"])
+        schema = safe_identifier(details["schema"])
+        dest_table = safe_identifier(details["table_name"])
+ 
+        staging_table = safe_identifier(f"{dest_table}_STAGE_{int(datetime.now(timezone.utc).timestamp())}")
+        staging_details = {"table_name": staging_table, "database": database, "schema": schema}
+ 
+        try:
+            self.write_dataframe(df, details=staging_details)
+ 
+            if self.op.check_if_table_exists(details):
+                self.drift.sync_missing_columns(df, details)
+            else:
+                # No destination yet: create it from the staging table's shape.
+                self.write_dataframe(df.iloc[0:0], details=details)
+ 
+            key_cols = [safe_identifier(k) for k in merge_keys]
+            all_cols = [safe_identifier(c) for c in df.columns]
+            update_cols = [c for c in all_cols if c not in key_cols]
+ 
+            on_clause = " AND ".join(f"dest.{k} = src.{k}" for k in key_cols)
+            set_clause = ", ".join(f"dest.{c} = src.{c}" for c in update_cols)
+            insert_cols = ", ".join(all_cols)
+            insert_vals = ", ".join(f"src.{c}" for c in all_cols)
+ 
+            merge_sql = f"""
+                MERGE INTO {database}.{schema}.{dest_table} AS dest
+                USING {database}.{schema}.{staging_table} AS src
+                ON {on_clause}
+                WHEN MATCHED THEN UPDATE SET {set_clause}
+                WHEN NOT MATCHED THEN INSERT ({insert_cols}) VALUES ({insert_vals})
+            """
+            with closing(self.conn.cursor()) as cursor:
+                cursor.execute(merge_sql)
+            logger.info("Merged %d row(s) into %s.%s.%s", len(df), database, schema, dest_table)
+        finally:
+            self.op.delete_table({"database": database, "schema": schema, "source_table": staging_table})
+ 
+ 
